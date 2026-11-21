@@ -11,9 +11,6 @@
     Blender（ring_level_builder）= rp_tube 顶点属性 → ColorRamp（原版）
 """
 import math
-import os
-import struct
-import zlib
 
 TOON_RING_STOPS = [
     (0.00, 0.62, 0.0), (0.045, 0.62, 0.0), (0.075, 1.00, 0.0),
@@ -64,24 +61,6 @@ def tube_to_u(tube):
     return (tube + 1.0) * 0.5
 
 
-# ---------------------------------------------------------------------------
-# 最小 PNG writer（UE 端导入用；C4D 端走 BaseBitmap.Save 不经此）
-# ---------------------------------------------------------------------------
-
-
-def write_ramp_png(path, hexstr):
-    """生成 256×1 sRGB 色带 PNG。"""
-    row = toon_rgb_row(hexstr)
-    raw = b"".join(b"\x00" + bytes(v for px in (row[i],) for v in px)
-                   for i in range(RAMP_W))
-
-    def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
-    ihdr = struct.pack(">IIBBBBB", RAMP_W, 1, 8, 2, 0, 0, 0)
-    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-           + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
-    with open(path, "wb") as f:
-        f.write(png)
-    return path
+# 说明：色带 PNG（256×1 sRGB）由仓库预生成提交（Content/Python/_ramp_<色>.png，
+# 共 11 色），运行时不写文件——UE 端 AssetImportTask 直接引用仓库文件，
+# C4D 端用 BaseBitmap 内存生成 + Save。生成脚本见仓库外本地工具。
