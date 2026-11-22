@@ -12,6 +12,7 @@
 import json
 import math
 import os
+import random
 import sys
 
 import c4d
@@ -247,6 +248,19 @@ def _pos_track(doc, obj, keys_cm):
     return track
 
 
+def _pos_track3(doc, obj, keys_vec):
+    """三维位置轨道（X/Y/Z 全分量，直线插值）。keys_vec = [(t_sec, c4d.Vector), ...]"""
+    track = c4d.CTrack(obj, c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_REL_POSITION)))
+    obj.InsertTrackSorted(track)
+    curve = track.GetCurve()
+    for t, p in keys_vec:
+        key = c4d.CKey()
+        key.SetTime(c4d.BaseTime(t))
+        key.SetValue(curve, p)
+        curve.InsertKey(key)
+    return track
+
+
 def _scale_track(doc, obj, keys_s):
     track = c4d.CTrack(obj, c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_REL_SCALE)))
     obj.InsertTrackSorted(track)
@@ -420,6 +434,160 @@ def bake_unlock(doc, json_path, start_sec=0.0, shatter=False):
     return {"ok": True, "keys": n, "frames": [0, round(T["end"] * fps)]}
 
 
+def _ring_objects(doc):
+    """按 RP_Ring_ 前缀收集环对象。"""
+    objs = {}
+
+    def _walk(o):
+        if o.GetName().startswith("RP_Ring_"):
+            objs[o.GetName()[len("RP_Ring_"):]] = o
+        for ch in o.GetChildren():
+            _walk(ch)
+
+    for top in doc.GetObjects():
+        _walk(top)
+    return objs
+
+
+def _clear_sand(doc):
+    """移除上一次沙粒破碎生成的实体弧段/细沙（重跑前清理）。"""
+    stale = []
+
+    def _walk(o):
+        name = o.GetName()
+        if name.startswith(("RP_Sand_", "RP_Grain_")):
+            stale.append(o)
+        for ch in o.GetChildren():
+            _walk(ch)
+
+    for top in doc.GetObjects():
+        _walk(top)
+    for o in stale:
+        o.Remove()
+    return len(stale)
+
+
+def bake_sand(doc, json_path, start_sec=0.0, ring_id=None, sections=12,
+              grains=240, spread=1.0, reverse=False, sweep_sec=0.6):
+    """沙粒破碎（同步 Blender 0.3.15）：起始帧整环缩没（扣件是子级一起消失），
+    原环切出的实体弧段沿 C 口依次脱落、绕 Y 翻滚滑出，随后在弧段自身网格表面
+    分批撒出哑光细沙，减速滑停（俯拍滑动版：以平面滑出替代立式下落）。
+    ring_id=None 时全部环同时破碎；reverse=True 从另一端开始。
+    返回 {"ok", "rings", "sections", "grains", "frames"}。"""
+    with open(json_path, "r", encoding="utf-8") as f:
+        L = json.load(f)
+    C.validate_level(L)
+    fps = int(L.get("fps") or 30)
+    _clear_sand(doc)
+    objs = _ring_objects(doc)
+    if not objs:
+        build(doc, json_path)
+        objs = _ring_objects(doc)
+    base = {r["id"]: r for r in L["rings"]}
+    targets = [ring_id] if ring_id else sorted(base)
+    missing = [k for k in targets if k not in objs or k not in base]
+    if missing:
+        raise ValueError("场景里找不到环：%s" % ", ".join(missing))
+    sections = max(1, min(G.SAND_SECTIONS_MAX, sections))
+    grain_variants = [G.sphere_mesh(0.145 * TUBE_DEFAULT, 8, v) for v in range(3)]
+    mats = {}
+    n_sections = n_grains = 0
+    end_sec = start_sec
+    for rid in targets:
+        r = base[rid]
+        s = r["scale"] / 100.0
+        obj = objs[rid]
+        color = C.asset(r["asset"]).get("color", "blue")
+        if color not in mats:
+            mats[color] = _make_toon_mat("RB_Toon_" + color,
+                                         RING_HEX.get(color, "888888"))
+            doc.InsertMaterial(mats[color])
+        _scale_track(doc, obj, [(start_sec, s), (start_sec + 1.0 / fps, 0.01)])
+        rng = random.Random(97 + grains + sections * 13
+                            + sum(ord(ch) for ch in rid))
+        plan = C.shard_layout({"asset": r["asset"]}, sections, reverse)["shards"]
+        windows = G.sand_windows(len(plan), start_sec, sweep_sec, reverse, fps)
+        px0, pz0 = r["x"] * PX_CM, -r["y"] * PX_CM
+        th = math.radians(-r["rotation"])
+        cos_t, sin_t = math.cos(th), math.sin(th)
+        step = 1.0 / fps
+        for idx, (sh, (detach, crumble, end)) in enumerate(zip(plan, windows)):
+            verts_ue, tris, _normals = G.shard_mesh(MID_RADIUS, TUBE_DEFAULT,
+                                                    sh["a0"], sh["a1"])
+            # UE 风格 (x, y平面, z 上) → C4D (x, z 上, -y 平面)，与 _tube_polys 同平面
+            verts = [(v[0], v[2], -v[1]) for v in verts_ue]
+            carrier = _sect_mesh(doc, None, "RP_Sand_%s_%02d" % (rid, idx),
+                                 verts, tris, mats[color])
+            carrier.SetRelPos(c4d.Vector(px0, 0.0, pz0))
+            carrier.SetRelRot(c4d.Vector(0.0, math.radians(-r["rotation"]), 0.0))
+            carrier.SetRelScale(c4d.Vector(s, s, s))
+            cx = sum(v[0] for v in verts) / len(verts)
+            cz = sum(v[1] for v in verts) / len(verts)
+            dl = math.hypot(cx, cz) or 1.0
+            wx = (cx / dl) * cos_t + (cz / dl) * sin_t
+            wz = -(cx / dl) * sin_t + (cz / dl) * cos_t
+            v_plane = spread * 45.3 * s * 2.0
+            spin_rate = (120 + 25 * (idx % 4)) * (-1 if idx % 2 else 1)
+            keys_pos, keys_rot = [], []
+            f = detach
+            while f < end - 1e-9:
+                t = f - detach
+                keys_pos.append((f, c4d.Vector(px0 + wx * v_plane * t, 0.0,
+                                               pz0 + wz * v_plane * t)))
+                keys_rot.append((f, -spin_rate * t))
+                f = round((f + step) * fps) / fps
+            keys_pos.append((end, c4d.Vector(px0 + wx * v_plane * (end - detach),
+                                             0.0,
+                                             pz0 + wz * v_plane * (end - detach))))
+            keys_rot.append((end, -spin_rate * (end - detach)))
+            _pos_track3(doc, carrier, keys_pos)
+            _rot_track(doc, carrier, keys_rot)
+            _scale_track(doc, carrier, [(detach, s), (crumble, s),
+                                        (end - step, 0.10 * s), (end, 0.01)])
+            n_sections += 1
+            end_sec = max(end_sec, end)
+            births = G.shard_surface_samples(
+                verts, tris, grains // len(plan) + (1 if idx < grains % len(plan) else 0),
+                rng)
+            for k, local in enumerate(births):
+                birth = round((crumble + G.SAND_CRUMBLE_SEC * k / max(1, len(births)))
+                              * fps) / fps
+                phi = math.radians(-r["rotation"] + spin_rate * (birth - detach))
+                cb, sb = math.cos(phi), math.sin(phi)
+                bx = px0 + wx * v_plane * (birth - detach) \
+                    + s * (local[0] * cb + local[2] * sb)
+                by = s * local[1]
+                bz = pz0 + wz * v_plane * (birth - detach) \
+                    + s * (-local[0] * sb + local[2] * cb)
+                scx, scy = G.sand_scatter(rng, spread, s)
+                vx = wx * v_plane + scx
+                vz = wz * v_plane + scy
+                keys = []
+                tau = 0.0
+                while True:
+                    fall = tau - tau * tau / (2.0 * G.SAND_STOP_SEC) \
+                        if tau < G.SAND_STOP_SEC else 0.5 * G.SAND_STOP_SEC
+                    keys.append((birth + tau,
+                                 c4d.Vector(bx + vx * fall,
+                                            by * max(0.0, 1.0 - tau / 0.2),
+                                            bz + vz * fall)))
+                    if tau >= G.SAND_STOP_SEC:
+                        break
+                    tau = round((tau + step) * fps) / fps
+                mesh_v, tris_v, _ = grain_variants[n_grains % 3]
+                size = 0.65 + 0.60 * rng.random()
+                grain = _sect_mesh(doc, None, "RP_Grain_%s_%03d" % (rid, n_grains),
+                                   mesh_v, tris_v, mats[color])
+                grain.SetRelPos(c4d.Vector(bx, by, bz))
+                grain.SetRelScale(c4d.Vector(s * size, s * size, s * size))
+                _pos_track3(doc, grain, keys)
+                n_grains += 1
+    c4d.EventAdd()
+    return {"ok": True, "rings": len(targets), "sections": n_sections,
+            "grains": n_grains,
+            "frames": [0, int(math.ceil((end_sec + G.SAND_STOP_SEC) * fps))]}
+
+
 class RingBuilderCommand(plugins.CommandData):
 
     def Execute(self, doc):
@@ -443,12 +611,40 @@ class RingBuilderCommand(plugins.CommandData):
         return True
 
 
+class SandBuilderCommand(plugins.CommandData):
+    """沙粒破碎命令：建模 + 沙粒动画（实体弧段脱落 → 分批撒细沙）。"""
+
+    def Execute(self, doc):
+        path = gui.LoadDialog(title="选择解环关卡 JSON（沙粒破碎）", suffix="json")
+        if not path:
+            return True
+        try:
+            r = build(doc, path)
+            u = bake_sand(doc, path)
+            gui.MessageDialog(
+                "沙粒破碎完成\n环 %d · 实体弧段 %d · 细沙 %d 粒\n动画至第 %d 帧"
+                % (r["rings"], u["sections"], u["grains"], u["frames"][1]))
+        except Exception as exc:
+            gui.MessageDialog("沙粒破碎失败：%s" % exc)
+            return False
+        c4d.EventAdd()
+        return True
+
+    def RestoreLayout(self, sec_ref):
+        return True
+
+
 if __name__ == "__main__":
     plugins.RegisterCommandPlugin(
         id=PLUGIN_ID, str=MENU_STR, info=0,
         help="读取 ring_level_builder 前端搭建器导出的关卡 JSON，"
              "程序化建模（共享 rp_core 解谜内核）并烘焙解环动画",
         bitmap=None, dat=RingBuilderCommand())
+    plugins.RegisterCommandPlugin(
+        id=PLUGIN_ID + 1, str="RingBuilder: 沙粒破碎动画", info=0,
+        help="建模后按沙粒模式破碎：实体弧段沿 C 口依次脱落，"
+             "分批撒出哑光细沙（同步 Blender 0.3.15）",
+        bitmap=None, dat=SandBuilderCommand())
 
 
 def setup_render(doc, json_path, out_dir="/renders/ring_ad",

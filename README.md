@@ -14,6 +14,20 @@
 程序化建模（花心/环/扣 + 材质 + 层级）+ 烘焙解环动画（旋转 → 移出 → 缩尾消失），
 弹窗汇报环数/扣数/关键帧数/帧范围。
 
+菜单 **扩展 → RingBuilder: 沙粒破碎动画**：建模后按沙粒模式破碎（同步
+Blender 0.3.15）——起始帧整环缩没（扣件是子级一起消失），原环切出的实体弧段
+沿 C 口依次脱落、绕 Y 翻滚滑出，随后在弧段自身网格表面分批撒出哑光细沙、
+减速滑停（俯拍滑动版：以平面滑动替代立式下落）。脚本可调：
+
+```python
+bake_sand(doc, json_path, start_sec=0.0, ring_id=None, sections=12,
+          grains=240, spread=1.0, reverse=False, sweep_sec=0.6)
+```
+
+`ring_id` 指定单环；`sections=1` 为整体脱落；`reverse=True` 从另一端开始；
+重跑自动替换上一次的弧段/细沙。默认与 Blender 端同一参数量级
+（弧段 ≤14、细沙 240 粒/环、散出速度随「散开幅度」）。
+
 关卡 JSON 来自前端搭建器导出；样例 `rb_level_sample.json`（花心 + 四 C 环，
 内核级测试已验证扣点精确、可解）。
 
@@ -31,7 +45,8 @@
 
 ## 首跑注意（无本机 C4D 环境，以下为真机首跑排查点）
 
-1. 本插件在 stub 干跑下验证了全部控制流；C4D 版本差异主要在材质通道常量名
+1. 本插件在 stub 干跑下验证了全部控制流（`tests/test_sand_stub.py` 覆盖
+   建模 + 解环 + 碎块 + 沙粒）；C4D 版本差异主要在材质通道常量名
    （`MATERIAL_LUMINANCE_CHANNEL` 等，R21+ 未变）。
 2. 相机未生成（MVP 用 C4D 默认视图/自建相机）；平行投影相机加
    `CAMERAOBJECT_PARALLEL_ZOOM` 一行即可，二期。
@@ -45,8 +60,10 @@
 已含：默认主题 C 环/整环 + T 扣占位箍、**卡通色带材质**（256×1 sRGB 纹理 + UVWTag 径向）、
 **三环结道具**（`rb_geom.knot_sections` 暖银）、**钻戒**（`rb_geom.gem_sections`：
 环带/六爪粉银 + 刻面钻石，metal/gem 双子对象挂 Null）、**破碎**（`bake_unlock(..., shatter=True)`：
-弧段碎片 12 片/环，drift/spin/缩尾 CTrack 动画，原环 hideAt 隐藏）、解环动画（同一时间轴）。
-样例关卡 `rb_level_sample.json` / `rb_level_sample2.json`（含钻戒+三环结）。
+弧段碎片 12 片/环，drift/spin/缩尾 CTrack 动画，原环 hideAt 隐藏）、**沙粒破碎**
+（`bake_sand`：实体弧段逐段脱落 → 表面分批撒细沙，与 Blender 端同步）、
+解环动画（同一时间轴）。样例关卡 `rb_level_sample.json` / `rb_level_sample2.json`
+（含钻戒+三环结）。
 
 ## 渲染出片
 
